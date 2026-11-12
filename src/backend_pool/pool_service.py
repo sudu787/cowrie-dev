@@ -84,7 +84,9 @@ class PoolService:
     A lock is required to manipulate VMs in states [available,
     using, used], since these are the ones that can be accessed by
     several consumers and the producer. All other states are accessed
-    only by the single producer.
+    only by the single producer. The lock also guards the guests list
+    itself: the producer adds and removes guests under it, since
+    consumers iterate the list while holding it.
     """
 
     _log = Logger()
@@ -306,9 +308,9 @@ class PoolService:
         Removes guests marked as destroyed (so no qemu domain existing)
         and simply removes their object from the list
         """
-        destroyed_guests = self.get_guest_states([POOL_STATE_DESTROYED])
-        for guest in destroyed_guests:
-            self.guests.remove(guest)
+        with self.guest_lock:
+            for guest in self.get_guest_states([POOL_STATE_DESTROYED]):
+                self.guests.remove(guest)
 
     def __producer_mark_available(self) -> None:
         """
@@ -343,22 +345,22 @@ class PoolService:
                 continue
             dom, snap, guest_ip = created
 
-            # create guest object
-            self.guests.append(
-                Guest(
-                    id=self.guest_id,
-                    state=POOL_STATE_CREATED,
-                    prev_state=None,  # used in case a guest is requested and freed immediately, to revert the state
-                    start_timestamp=time.time(),
-                    guest_ip=guest_ip,
-                    connected=0,
-                    client_ips=list(),
-                    freed_timestamp=-1,
-                    domain=dom,
-                    snapshot=snap,
-                    name="",
-                )
+            # create guest object; the slow create_guest() above runs unlocked
+            guest = Guest(
+                id=self.guest_id,
+                state=POOL_STATE_CREATED,
+                prev_state=None,  # used in case a guest is requested and freed immediately, to revert the state
+                start_timestamp=time.time(),
+                guest_ip=guest_ip,
+                connected=0,
+                client_ips=list(),
+                freed_timestamp=-1,
+                domain=dom,
+                snapshot=snap,
+                name="",
             )
+            with self.guest_lock:
+                self.guests.append(guest)
 
             self.guest_id += 1
 
@@ -392,61 +394,60 @@ class PoolService:
             self.loop_sleep_time, self.producer_loop
         )
 
-    # Consumers
+    # Consumers; the caller holds guest_lock
     def __consumers_get_guest_ip(self, src_ip: str) -> Guest | None:
-        with self.guest_lock:
-            # if ip is the same, doesn't matter if being used or not
-            usable_guests = self.get_guest_states([POOL_STATE_USED, POOL_STATE_USING])
-            for guest in usable_guests:
-                if src_ip in guest.client_ips:
-                    return guest
+        # if ip is the same, doesn't matter if being used or not
+        usable_guests = self.get_guest_states([POOL_STATE_USED, POOL_STATE_USING])
+        for guest in usable_guests:
+            if src_ip in guest.client_ips:
+                return guest
         return None
 
     def __consumers_get_available_guest(self) -> Guest | None:
-        with self.guest_lock:
-            available_guests = self.get_guest_states([POOL_STATE_AVAILABLE])
-            for guest in available_guests:
-                return guest
+        available_guests = self.get_guest_states([POOL_STATE_AVAILABLE])
+        for guest in available_guests:
+            return guest
         return None
 
     def __consumers_get_any_guest(self) -> Guest | None:
         """
         try to get a VM with few clients
         """
-        with self.guest_lock:
-            usable_guests = self.get_guest_states([POOL_STATE_USING, POOL_STATE_USED])
-            if usable_guests:
-                return min(usable_guests, key=lambda guest: guest.connected)
-            else:
-                return None
+        usable_guests = self.get_guest_states([POOL_STATE_USING, POOL_STATE_USED])
+        if usable_guests:
+            return min(usable_guests, key=lambda guest: guest.connected)
+        else:
+            return None
 
     # Consumer methods to be called concurrently
     def request_vm(self, src_ip: str) -> tuple[int, str, str]:
-        # first check if there is one for the ip
-        guest = self.__consumers_get_guest_ip(src_ip)
+        # Select and claim the guest in one locked section, so the producer
+        # cannot mark it for destruction in between.
+        with self.guest_lock:
+            # first check if there is one for the ip
+            guest = self.__consumers_get_guest_ip(src_ip)
 
-        if not guest:
-            # try to get an available VM
-            guest = self.__consumers_get_available_guest()
+            if not guest:
+                # try to get an available VM
+                guest = self.__consumers_get_available_guest()
 
-        # or get any other if policy is to share VMs
-        if not guest and self.share_guests:
-            guest = self.__consumers_get_any_guest()
+            # or get any other if policy is to share VMs
+            if not guest and self.share_guests:
+                guest = self.__consumers_get_any_guest()
+
+            if guest:
+                guest.prev_state = guest.state
+                guest.state = POOL_STATE_USING
+                guest.connected += 1
+                guest.client_ips.append(src_ip)
+                return guest.id, guest.guest_ip, guest.snapshot
 
         # raise excaption if a valid VM was not found
-        if not guest:
-            # TODO fix for no VM available
-            if self.any_vm_up:
-                self._log.info("Inconsistent state in pool, restarting...")
-                self.stop_pool()
-            raise NoAvailableVMs()
-
-        guest.prev_state = guest.state
-        guest.state = POOL_STATE_USING
-        guest.connected += 1
-        guest.client_ips.append(src_ip)
-
-        return guest.id, guest.guest_ip, guest.snapshot
+        # TODO fix for no VM available
+        if self.any_vm_up:
+            self._log.info("Inconsistent state in pool, restarting...")
+            self.stop_pool()
+        raise NoAvailableVMs()
 
     def free_vm(self, guest_id: int) -> None:
         with self.guest_lock:
