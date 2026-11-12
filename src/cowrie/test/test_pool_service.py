@@ -2,20 +2,24 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-# ABOUTME: Tests that the backend pool's guest list is changed under guest_lock
-# ABOUTME: and that a consumer selects and claims a guest in one locked section.
+# ABOUTME: Tests the backend pool's locking of its guest list and that every
+# ABOUTME: producer iteration runs in a worker thread, off the reactor.
 
 from __future__ import annotations
 
+import sys
 import unittest
 from typing import Any
 from unittest import mock
 
-from backend_pool import util
+from twisted.internet import defer, task, threads
+
+from backend_pool import pool_service, util
 from backend_pool.libvirt import backend_service
 from backend_pool.pool_service import (
     POOL_STATE_AVAILABLE,
     POOL_STATE_DESTROYED,
+    POOL_STATE_UNAVAILABLE,
     POOL_STATE_USED,
     POOL_STATE_USING,
     Guest,
@@ -165,6 +169,140 @@ class RequestVmTests(unittest.TestCase):
         with self.assertRaises(NoAvailableVMs):
             self.service.request_vm("203.0.113.5")
         self.assertFalse(self.service.guest_lock.locked())
+
+
+class ProducerLoopTests(unittest.TestCase):
+    """Every producer iteration runs in a worker thread, and stopping or
+    restarting the pool stops the old loop (issue #40449)."""
+
+    def setUp(self) -> None:
+        # stop_pool() imports libvirt lazily; it is not installed in tests.
+        libvirt: Any = mock.MagicMock()
+        libvirt.libvirtError = type("libvirtError", (Exception,), {})
+        modules = mock.patch.dict(sys.modules, {"libvirt": libvirt})
+        modules.start()
+        self.addCleanup(modules.stop)
+
+        self.service = make_service(self)
+        self.service.qemu.create_guest.return_value = None
+        self.clock = task.Clock()
+        for target, attr, value in (
+            (pool_service, "reactor", self.clock),
+            (threads, "deferToThread", self.defer_to_thread),
+        ):
+            patcher = mock.patch.object(target, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.handoffs: list[tuple[Any, defer.Deferred[None]]] = []
+
+    def defer_to_thread(self, f: Any) -> defer.Deferred[None]:
+        d: defer.Deferred[None] = defer.Deferred()
+        self.handoffs.append((f, d))
+        return d
+
+    def finish_iteration(self, index: int = -1) -> None:
+        self.handoffs[index][1].callback(None)
+
+    def producer_timers(self) -> list[Any]:
+        # start_pool() may also arm the separate recycle timer
+        # ([backend_pool] recycle_period); only producer timers matter here.
+        return [
+            c
+            for c in self.clock.getDelayedCalls()
+            if getattr(c, "func", None) == self.service._run_producer
+        ]
+
+    def test_every_iteration_is_handed_to_a_thread(self) -> None:
+        self.service.start_pool()
+        for _ in range(3):
+            self.finish_iteration()
+            self.clock.advance(self.service.loop_sleep_time)
+        self.assertEqual(len(self.handoffs), 4)
+        for f, _ in self.handoffs:
+            self.assertEqual(f, self.service.producer_loop)
+
+    def test_producer_loop_schedules_nothing_itself(self) -> None:
+        # It runs in a worker thread, where touching the reactor is unsafe.
+        self.service.producer_loop()
+        self.assertEqual(self.producer_timers(), [])
+
+    def test_next_iteration_waits_for_the_previous_one(self) -> None:
+        self.service.start_pool()
+        self.clock.advance(60)
+        self.assertEqual(len(self.handoffs), 1)
+        self.finish_iteration()
+        self.clock.advance(self.service.loop_sleep_time)
+        self.assertEqual(len(self.handoffs), 2)
+
+    def test_failed_iteration_is_logged_and_the_loop_goes_on(self) -> None:
+        with mock.patch.object(PoolService, "_log") as log:
+            self.service.start_pool()
+            self.handoffs[0][1].errback(RuntimeError("libvirt went away"))
+            self.clock.advance(self.service.loop_sleep_time)
+        log.failure.assert_called_once()
+        self.assertEqual(len(self.handoffs), 2)
+
+    def test_stop_during_an_iteration(self) -> None:
+        self.service.start_pool()
+        self.service.stop_pool()  # must not raise AlreadyCalled
+        self.finish_iteration()
+        self.assertEqual(self.producer_timers(), [])
+
+    def test_stop_between_iterations_cancels_the_timer(self) -> None:
+        self.service.start_pool()
+        self.finish_iteration()
+        self.service.stop_pool()
+        self.assertEqual(self.producer_timers(), [])
+        self.service.stop_pool()  # a second stop must not raise either
+
+    def test_restart_during_an_iteration_runs_one_loop(self) -> None:
+        self.service.start_pool()
+        self.service.restart_pool()
+        self.assertEqual(len(self.handoffs), 2)
+        self.finish_iteration(0)  # the old loop's iteration
+        self.assertEqual(self.producer_timers(), [])
+        self.finish_iteration(1)
+        self.assertEqual(len(self.producer_timers()), 1)
+
+
+class HealthCheckTests(unittest.TestCase):
+    """The health check probes guests without holding guest_lock."""
+
+    def setUp(self) -> None:
+        self.service = make_service(self)
+
+    def check_health(self) -> None:
+        self.service._PoolService__producer_check_health()  # type: ignore[attr-defined]
+
+    def test_probes_run_without_the_lock(self) -> None:
+        held: list[bool] = []
+
+        def probe(ip: str, port: int) -> bool:
+            held.append(self.service.guest_lock.locked())
+            return ip != "192.168.150.11"
+
+        self.service.guests = [
+            make_guest(1, POOL_STATE_AVAILABLE),
+            make_guest(2, POOL_STATE_USED),
+        ]
+        with mock.patch.object(util, "nmap_port", side_effect=probe):
+            self.check_health()
+        self.assertTrue(held)
+        self.assertFalse(any(held))
+        states = [g.state for g in self.service.guests]
+        self.assertEqual(states, [POOL_STATE_UNAVAILABLE, POOL_STATE_USED])
+
+    def test_guest_that_changed_during_the_probe_is_left_alone(self) -> None:
+        guest = make_guest(1, POOL_STATE_USED)
+        self.service.guests = [guest]
+
+        def probe(ip: str, port: int) -> bool:
+            guest.state = POOL_STATE_DESTROYED
+            return False
+
+        with mock.patch.object(util, "nmap_port", side_effect=probe):
+            self.check_health()
+        self.assertEqual(guest.state, POOL_STATE_DESTROYED)
 
 
 if __name__ == "__main__":

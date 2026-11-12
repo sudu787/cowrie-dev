@@ -102,6 +102,9 @@ class PoolService:
         # time in seconds between each loop iteration
         self.loop_sleep_time: int = 5
         self.loop_next_call = None
+        # bumped by stop_pool() so a producer iteration in flight does not
+        # reschedule a stopped or restarted pool
+        self._loop_generation: int = 0
 
         # default configs; custom values will come from the client
         # when they connect to the pool
@@ -149,7 +152,7 @@ class PoolService:
         self.any_vm_up = False  # TODO fix for no VM available
 
         # start producer
-        threads.deferToThread(self.producer_loop)
+        self._run_producer(self._loop_generation)
 
         # recycle myself after some time
         recycle_period = CowrieConfig.getint(
@@ -165,9 +168,12 @@ class PoolService:
 
         self._log.info("Trying pool clean stop")
 
-        # stop loop
-        if self.loop_next_call:
+        # stop loop; an iteration still running in its thread will see the
+        # new generation and not reschedule itself
+        self._loop_generation += 1
+        if self.loop_next_call is not None and self.loop_next_call.active():
             self.loop_next_call.cancel()
+        self.loop_next_call = None
 
         # try destroying all guests
         for guest in self.guests:
@@ -278,18 +284,27 @@ class PoolService:
         Checks all usable guests, and whether they should have connectivity. If they don't, then
         mark them for deletion.
         """
+        usable = [POOL_STATE_AVAILABLE, POOL_STATE_USING, POOL_STATE_USED]
         with self.guest_lock:
-            usable_guests = self.get_guest_states(
-                [POOL_STATE_AVAILABLE, POOL_STATE_USING, POOL_STATE_USED]
-            )
-            for guest in usable_guests:
-                if not self.has_connectivity(guest.guest_ip):
-                    self._log.info(
-                        "Guest {guest_id} @ {guest_ip} has no connectivity... Destroying",
-                        guest_id=guest.id,
-                        guest_ip=guest.guest_ip,
-                    )
-                    guest.state = POOL_STATE_UNAVAILABLE
+            usable_guests = self.get_guest_states(usable)
+
+        # Probe without the lock: each probe runs nmap, and a consumer on the
+        # reactor thread would otherwise wait on the lock for all of them.
+        unreachable = [
+            g for g in usable_guests if not self.has_connectivity(g.guest_ip)
+        ]
+
+        with self.guest_lock:
+            for guest in unreachable:
+                # A consumer may have changed the guest while it was probed.
+                if guest.state not in usable:
+                    continue
+                self._log.info(
+                    "Guest {guest_id} @ {guest_ip} has no connectivity... Destroying",
+                    guest_id=guest.id,
+                    guest_ip=guest.guest_ip,
+                )
+                guest.state = POOL_STATE_UNAVAILABLE
 
     def __producer_destroy_timed_out(self) -> None:
         """
@@ -389,9 +404,27 @@ class PoolService:
         # check for created VMs that can become available
         self.__producer_mark_available()
 
-        # sleep until next iteration
+    def _run_producer(self, generation: int) -> None:
+        """Run one producer iteration in a worker thread, then schedule the
+        next one. Called on the reactor thread only: producer_loop() does
+        blocking libvirt and nmap work, and must never run on the reactor."""
+        if generation != self._loop_generation:
+            return
+        d = threads.deferToThread(self.producer_loop)
+        d.addErrback(
+            lambda f: self._log.failure("Pool producer iteration failed", failure=f)
+        )
+        # deferToThread's Deferred fires on the reactor thread, so callLater
+        # in _schedule_next is safe.
+        d.addBoth(lambda _: self._schedule_next(generation))
+
+    def _schedule_next(self, generation: int) -> None:
+        # A pool stopped (or restarted) while this iteration ran must not
+        # be revived by it.
+        if generation != self._loop_generation:
+            return
         self.loop_next_call = reactor.callLater(
-            self.loop_sleep_time, self.producer_loop
+            self.loop_sleep_time, self._run_producer, generation
         )
 
     # Consumers; the caller holds guest_lock
